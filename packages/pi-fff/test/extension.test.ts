@@ -17,11 +17,12 @@ let finders: MockFinder[] = [];
 let mixedSearchImpl: ((query: string, options: unknown) => unknown) | undefined;
 let grepImpl: ((query: string, options: unknown) => unknown) | undefined;
 let scanProgressImpl: (() => unknown) | undefined;
+let waitForScanImpl: (() => Promise<unknown>) | undefined;
 
 function createMockFinder(): MockFinder {
   return {
     isDestroyed: false,
-    waitForScan: mock(async () => undefined),
+    waitForScan: mock(async () => waitForScanImpl?.()),
     getScanProgress: mock(() => {
       if (scanProgressImpl) return scanProgressImpl();
       return {
@@ -137,6 +138,7 @@ mock.module("@sinclair/typebox", () => ({
 }));
 
 const { default: fffExtension } = await import("../src/index");
+const { takeParkedFinder } = await import("../src/finder-handoff");
 
 type EventHandler = (...args: any[]) => unknown;
 
@@ -194,6 +196,11 @@ function createContext(cwd = "/tmp/workspace") {
   };
 }
 
+// session_start warms the index in the background (#477); let it finish.
+function settle() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 async function start(mode?: string, cwd?: string, flags: Record<string, unknown> = {}) {
   const setup = createPi(mode, flags);
   const ctx = createContext(cwd);
@@ -202,12 +209,13 @@ async function start(mode?: string, cwd?: string, flags: Record<string, unknown>
   const sessionStart = setup.events.get("session_start");
   expect(sessionStart).toBeDefined();
   await sessionStart?.({ reason: "startup" }, ctx);
+  await settle();
 
   return { ...setup, ctx };
 }
 
-async function shutdown(setup: { events: Map<string, EventHandler> }) {
-  await setup.events.get("session_shutdown")?.({}, undefined);
+async function shutdown(setup: { events: Map<string, EventHandler> }, reason?: string) {
+  await setup.events.get("session_shutdown")?.(reason ? { reason } : {}, undefined);
 }
 
 function currentProvider(
@@ -244,9 +252,12 @@ const configPath = path.join(agentDir, "pi-fff.json");
 beforeEach(() => {
   createCalls.length = 0;
   finders = [];
+  // Do not let one test's handed-off picker leak into the next.
+  takeParkedFinder();
   mixedSearchImpl = undefined;
   grepImpl = undefined;
   scanProgressImpl = undefined;
+  waitForScanImpl = undefined;
 
   for (const key of CONFIG_ENV_KEYS) delete process.env[key];
   process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -708,6 +719,142 @@ describe("pi-fff $HOME scan warning", () => {
 
     expect(setup.ctx.ui.notify).not.toHaveBeenCalled();
     await shutdown(setup);
+  });
+});
+
+// #477: pi waits for session_start on startup, /new and /resume, and loads the
+// extension again on each of them.
+describe("pi-fff session lifecycle", () => {
+  function deferredScan() {
+    let release!: (error?: Error) => void;
+    const scan = new Promise<void>((resolve, reject) => {
+      release = (error) => (error ? reject(error) : resolve());
+    });
+    waitForScanImpl = () => scan;
+    return release;
+  }
+
+  test("session_start does not wait for the initial scan", async () => {
+    const release = deferredScan();
+    const setup = createPi();
+    const ctx = createContext();
+    fffExtension(setup.pi as any);
+
+    let started = false;
+    const pending = Promise.resolve(
+      setup.events.get("session_start")?.({ reason: "startup" }, ctx),
+    ).then(() => {
+      started = true;
+    });
+    await settle();
+
+    expect(started).toBe(true);
+    expect(createCalls).toHaveLength(1);
+    release();
+    await pending;
+    await shutdown(setup);
+  });
+
+  test("reports an init failure from the background warmup", async () => {
+    waitForScanImpl = () => Promise.reject(new Error("scan exploded"));
+    const { ctx } = await start();
+
+    const [message, level] = ctx.ui.notify.mock.calls[0];
+    expect(message).toBe("FFF init failed: scan exploded");
+    expect(level).toBe("error");
+  });
+
+  test("stays silent about a warmup failure after shutdown", async () => {
+    const release = deferredScan();
+    const setup = await start();
+    await shutdown(setup, "quit");
+    release(new Error("scan exploded"));
+    await settle();
+
+    expect(setup.ctx.ui.notify).not.toHaveBeenCalled();
+  });
+
+  test("/resume in the same cwd reuses the index", async () => {
+    const first = await start();
+    await shutdown(first, "resume");
+    expect(finders[0].isDestroyed).toBe(false);
+
+    const second = await start();
+    expect(createCalls).toHaveLength(1);
+    expect(finders[0].isDestroyed).toBe(false);
+
+    await shutdown(second, "quit");
+    expect(finders[0].isDestroyed).toBe(true);
+  });
+
+  test.each(["new", "fork", "reload"])(
+    "%s in the same cwd reuses the index",
+    async (reason) => {
+      const first = await start();
+      await shutdown(first, reason);
+      const second = await start();
+
+      expect(createCalls).toHaveLength(1);
+      await shutdown(second);
+    },
+  );
+
+  test("hands over a scan that is still running", async () => {
+    const release = deferredScan();
+    const first = await start();
+    await shutdown(first, "resume");
+
+    const second = await start();
+    release();
+    await settle();
+
+    expect(createCalls).toHaveLength(1);
+    expect(finders[0].isDestroyed).toBe(false);
+    await shutdown(second);
+  });
+
+  test("a different cwd destroys the old index before opening a new one", async () => {
+    const first = await start(undefined, "/tmp/workspace-a");
+    await shutdown(first, "resume");
+    const second = await start(undefined, "/tmp/workspace-b");
+
+    expect(createCalls).toHaveLength(2);
+    expect(finders[0].isDestroyed).toBe(true);
+    expect(finders[1].isDestroyed).toBe(false);
+    await shutdown(second);
+  });
+
+  test("changed scan options destroy the old index", async () => {
+    const first = await start();
+    await shutdown(first, "reload");
+    process.env.FFF_FOLLOW_SYMLINKS = "0";
+    const second = await start();
+
+    expect(createCalls).toHaveLength(2);
+    expect(finders[0].isDestroyed).toBe(true);
+    await shutdown(second);
+  });
+
+  test("quit destroys the index and leaves nothing behind", async () => {
+    const first = await start();
+    await shutdown(first, "quit");
+    expect(finders[0].isDestroyed).toBe(true);
+
+    const second = await start();
+    expect(createCalls).toHaveLength(2);
+    await shutdown(second);
+  });
+
+  test("an opted-out cwd discards the handed-over index", async () => {
+    const first = await start();
+    await shutdown(first, "resume");
+    process.env.FFF_ENABLE_HOME_SCAN = "0";
+    const second = await start(undefined, os.homedir());
+    await settle();
+
+    expect(createCalls).toHaveLength(1);
+    expect(finders[0].isDestroyed).toBe(true);
+    await shutdown(second);
   });
 });
 

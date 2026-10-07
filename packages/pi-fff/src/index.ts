@@ -31,6 +31,14 @@ import { Type, type TSchema } from "@sinclair/typebox";
 import { AuxFinderPool, routePathConstraint } from "./aux-finders";
 import { type FffMode, loadConfig, VALID_MODES } from "./config";
 import { FilePickerFactory } from "./file-picker";
+import {
+  claimFinder,
+  discardFinder,
+  type FinderHandoff,
+  isReplacement,
+  parkFinder,
+  takeParkedFinder,
+} from "./finder-handoff";
 import { isFsRoot, isHomeDir, resolveDbPaths } from "./paths";
 import { buildQuery } from "./query";
 
@@ -310,7 +318,12 @@ export default function fffExtension(pi: ExtensionAPI) {
   // base path at a time — otherwise parallel tool calls would race and
   // deadlock at the native layer (issue #403).
   let finderPromise: Promise<FileFinderApi> | null = null;
+  let finderPromiseCwd: string | null = null;
   let activeCwd = process.cwd();
+  // The previous session's picker, handed over across a session replacement.
+  let adoptedFinder: FinderHandoff | null = null;
+  // Set on session_shutdown; background work must not touch a stale ctx.
+  let disposed = false;
 
   const config = loadConfig();
 
@@ -478,6 +491,19 @@ export default function fffExtension(pi: ExtensionAPI) {
     return null;
   }
 
+  // A handed-off picker is reused only if it was opened with the same root and
+  // options; anything else would index the wrong tree or databases.
+  function finderKey(cwd: string): string {
+    return JSON.stringify([
+      nodePath.resolve(cwd),
+      enableHomeDirScanning,
+      enableFsRootScanning,
+      followSymlinks,
+      resolvedDbPaths?.frecency,
+      resolvedDbPaths?.history,
+    ]);
+  }
+
   // in case cwd changes we need to figure this out
   function ensureFinder(cwd: string): Promise<FileFinderApi> {
     const optOut = scanOptOutReason(cwd);
@@ -488,6 +514,7 @@ export default function fffExtension(pi: ExtensionAPI) {
 
     if (finderPromise) return finderPromise;
 
+    finderPromiseCwd = cwd;
     finderPromise = (async () => {
       if (mainFinder && !mainFinder.isDestroyed) {
         mainFinder.destroy();
@@ -495,22 +522,54 @@ export default function fffExtension(pi: ExtensionAPI) {
         finderCwd = null;
       }
 
-      // if the dbs can't be opened the factory falls back to a db-less picker,
-      // e.g. when some other process corrupts the lock
-      if (!pickers) throw new Error("FFF picker factory is not initialized");
-      mainFinder = await pickers.create({
-        basePath: cwd,
-        enableHomeDirScanning,
-        enableFsRootScanning,
-        followSymlinks,
-      });
+      const adopted = adoptedFinder;
+      adoptedFinder = null;
+      let finder = adopted ? await claimFinder(adopted, finderKey(cwd)) : null;
+
+      if (!finder) {
+        // if the dbs can't be opened the factory falls back to a db-less picker,
+        // e.g. when some other process corrupts the lock
+        if (!pickers) throw new Error("FFF picker factory is not initialized");
+        finder = await pickers.create({
+          basePath: cwd,
+          enableHomeDirScanning,
+          enableFsRootScanning,
+          followSymlinks,
+        });
+      }
+      mainFinder = finder;
       finderCwd = cwd;
-      return mainFinder;
+      return finder;
     })().finally(() => {
       finderPromise = null;
+      finderPromiseCwd = null;
     });
 
     return finderPromise;
+  }
+
+  // Hand the cwd picker (ready or still scanning) to the next instance, so a
+  // session switch in the same cwd does not rescan the tree.
+  function handOffFinder(): void {
+    let handoff: FinderHandoff | null = null;
+    if (finderPromise && finderPromiseCwd !== null) {
+      handoff = { key: finderKey(finderPromiseCwd), finder: finderPromise };
+    } else if (mainFinder && !mainFinder.isDestroyed && finderCwd !== null) {
+      handoff = { key: finderKey(finderCwd), finder: Promise.resolve(mainFinder) };
+    }
+
+    if (handoff) {
+      parkFinder(handoff);
+      // This instance no longer owns it; destroyFinder() must leave it alone.
+      finderPromise = null;
+      finderPromiseCwd = null;
+      mainFinder = null;
+      finderCwd = null;
+    } else if (adoptedFinder) {
+      // Never claimed (e.g. no search ran under SDK use): pass it on unchanged.
+      parkFinder(adoptedFinder);
+      adoptedFinder = null;
+    }
   }
 
   function stopHomeScanStatus(): void {
@@ -551,6 +610,17 @@ export default function fffExtension(pi: ExtensionAPI) {
       mainFinder.destroy();
       mainFinder = null;
       finderCwd = null;
+    }
+    // session_start no longer waits for the scan, so creation can still be
+    // in flight here; destroy the picker once it lands.
+    if (finderPromise) {
+      discardFinder({ key: "", finder: finderPromise });
+      finderPromise = null;
+      finderPromiseCwd = null;
+    }
+    if (adoptedFinder) {
+      discardFinder(adoptedFinder);
+      adoptedFinder = null;
     }
 
     auxPool?.destroy();
@@ -776,6 +846,8 @@ export default function fffExtension(pi: ExtensionAPI) {
 
     // Pi populates extension flag values after loading extensions.
     resolveStartupConfig();
+    // Claimed lazily by ensureFinder(), which checks it matches this cwd.
+    adoptedFinder = takeParkedFinder();
 
     // FFF-named tools are ours alone, so they are always safe to drop. Override
     // names collide with pi's builtins and are only stale once this session ran
@@ -819,10 +891,10 @@ export default function fffExtension(pi: ExtensionAPI) {
       const optOut = scanOptOutReason(activeCwd);
       if (optOut) {
         ctx.ui.notify(optOut, "warning");
+        if (adoptedFinder) discardFinder(adoptedFinder);
+        adoptedFinder = null;
         return;
       }
-
-      await ensureFinder(activeCwd);
 
       // Warn when launched from $HOME with home scanning on: indexing a large
       // home tree can run for a long time in the background (issue #743).
@@ -835,9 +907,21 @@ export default function fffExtension(pi: ExtensionAPI) {
         );
       }
 
-      // waitForScan() also resolves on timeout, so poll until the scan really
-      // settles before clearing the footer.
-      if (atHome) trackHomeScanStatus();
+      // Warm the index without blocking session start: pi waits for this
+      // handler on startup, /new and /resume (issue #477). Tool calls and
+      // @-mentions await the same in-flight ensureFinder() promise.
+      ensureFinder(activeCwd).then(
+        () => {
+          // waitForScan() also resolves on timeout, so poll until the scan
+          // really settles before clearing the footer.
+          if (atHome && !disposed) trackHomeScanStatus();
+        },
+        (error: unknown) => {
+          if (disposed) return;
+          stopHomeScanStatus();
+          reportInitFailure(ctx, error);
+        },
+      );
     } catch (error: unknown) {
       reportInitFailure(ctx, error);
     }
@@ -854,7 +938,10 @@ export default function fffExtension(pi: ExtensionAPI) {
     }
   });
 
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (event?: { reason?: string }) => {
+    disposed = true;
+    // Another session follows in this process: keep the index for it.
+    if (isReplacement(event?.reason)) handOffFinder();
     destroyFinder();
   });
 
